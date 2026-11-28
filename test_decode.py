@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from cuda_graph import DecodeGraph
 from model import GPT2, GPT2Config
 
 
@@ -77,6 +78,36 @@ class DecodeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "inference_mode"):
             self.model(torch.ones((1, 2), dtype=torch.long), kv_cache=cache)
         self.assertEqual(cache.length, 0)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is None, "requires NVIDIA CUDA"
+    )
+    @torch.inference_mode()
+    def test_decode_graph_advances_past_attention_tile_boundary(self):
+        config = GPT2Config(vocab_size=97, block_size=72, n_layer=2, n_head=4, n_embd=64)
+        model = GPT2(config).cuda().half().eval()
+        tokens = torch.randint(config.vocab_size, (2, 72), device="cuda")
+        expected = model(tokens)
+
+        for use_triton in (False, True):
+            with self.subTest(use_triton=use_triton):
+                cache = model.create_kv_cache(batch_size=2)
+                model(tokens[:, :61], kv_cache=cache)
+                prefix = cache.keys[:, :, :, :61].clone()
+                decoder = DecodeGraph(model, cache, use_triton_attention=use_triton)
+                self.assertEqual(decoder.position.item(), 61)
+                with self.assertRaisesRegex(ValueError, "one integer token"):
+                    decoder.decode(tokens[:, :2])
+                for position in range(61, 72):
+                    actual = decoder.decode(tokens[:, position : position + 1])
+                    torch.testing.assert_close(
+                        actual, expected[:, position : position + 1], atol=1e-2, rtol=1e-2
+                    )
+                    self.assertEqual(cache.length, position + 1)
+                self.assertEqual(decoder.position.item(), 72)
+                torch.testing.assert_close(cache.keys[:, :, :, :61], prefix)
+                with self.assertRaisesRegex(ValueError, "capacity"):
+                    decoder.decode(tokens[:, :1])
 
 
 if __name__ == "__main__":
