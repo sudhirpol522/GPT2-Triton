@@ -139,7 +139,7 @@ with torch.inference_mode():
 
 Create the cache after moving the model to the intended device and dtype. Each batch uses equal-length prompts without padding, and decode takes one token per sequence. Create a new cache for a new batch or prompt. The prompt and decoded tokens together must fit within `max_length` and the model's context limit.
 
-This version uses a Python cache length and slices the filled prefix, so it is an eager PyTorch reference, not a CUDA graph decode implementation. The model still uses random weights. Run `python -m unittest test_decode.py` to check cached logits, greedy token choices, unchanged cache storage, and input validation against the full forward path.
+The eager reference uses a Python cache length and slices the filled prefix. The model still uses random weights. Run `python -m unittest test_decode.py` to check cached logits, greedy token choices, unchanged cache storage, and input validation against the full forward path. The CUDA graph test runs when an NVIDIA GPU is available.
 
 I ran the cached decode path on the Colab NVIDIA L4 in FP16 with PyTorch `2.14.1+cu130`. Both paths project only the last token to logits. The uncached path reruns the transformer on the growing prefix. The table reports milliseconds per decode step, using the median of three 16-step runs after warmup. Prefill, cache allocation, and sampling are outside the measurement.
 
@@ -178,8 +178,47 @@ I then captured a single cached decode step using a fixed position. Each replay 
 | 1 | 1008 | 6.486 | 1.559 | 4.16x |
 | 8 | 512 | 6.403 | 2.112 | 3.03x |
 
-This suggests trying graph replay with a growing cache position first for small batches. Linear layers accounted for about 78% of GPU work at batch 1 and 128 tokens. Attention took a bigger share at batch 8 and 512 tokens, reaching about 35% of active GPU time. I would use that larger shape to check whether a custom attention kernel helps after measuring growing-context graph decode.
+This suggested trying graph replay with a growing cache position first for small batches. Linear layers accounted for about 78% of GPU work at batch 1 and 128 tokens. Attention took a bigger share at batch 8 and 512 tokens, reaching about 35% of active GPU time. I used that larger shape to check whether a custom attention kernel helps.
 
 ![Decode profile and fixed-position graph probe on NVIDIA L4](assets/decode-profile-l4.jpg)
 
 [Download the L4 trace archive](assets/decode-profile-l4.zip) for the eight profiler traces and both sets of summary numbers. The public copy omits the Colab runtime hostname.
+
+### CUDA graph decode with a growing cache
+
+I kept the token and cache buffers at fixed addresses for replay. Each step writes to the slot given by a GPU position tensor, then increments that tensor as part of the graph. PyTorch SDPA gets a mask for the filled prefix. The Triton kernel uses one program per batch item and attention head. It reads the filled part of the cache in 64-token tiles and combines the dot products, softmax, and weighted sum of values. Both paths use the same PyTorch layers and cache writes.
+
+I ran `python benchmark_decode.py` on the Colab NVIDIA L4 with PyTorch `2.14.1+cu130`, Triton `3.8.0`, and full GPT-2 in FP16. Each timed run processes 16 successive tokens after prefill. Numbers are milliseconds per step, using the median of three CUDA event measurements. The graph times include copying in each token and replaying the graph. Cache allocation, prefill, graph capture, and sampling are outside the timed loop.
+
+| Batch | Prompt tokens | PyTorch eager | PyTorch graph | Triton attention graph | Graph speedup |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 32 | 4.546 | 1.436 | 1.332 | 1.08x |
+| 1 | 128 | 4.497 | 1.531 | 1.394 | 1.10x |
+| 1 | 512 | 4.686 | 1.790 | 1.549 | 1.16x |
+| 1 | 1008 | 4.677 | 2.089 | 1.758 | 1.19x |
+| 4 | 128 | 4.756 | 1.563 | 1.426 | 1.10x |
+| 4 | 512 | 4.980 | 1.902 | 1.711 | 1.11x |
+| 8 | 128 | 4.686 | 1.635 | 1.514 | 1.08x |
+| 8 | 512 | 4.704 | 2.235 | 2.057 | 1.09x |
+
+Both graph paths matched eager decode at all 128 positions (`atol=1e-2`, `rtol=1e-2`). The largest absolute logit difference was 0.004883. The graph accounted for most of the latency drop. Switching attention to Triton gave a further 1.08x to 1.19x speedup over the PyTorch graph in this run. A repeat showed 1.08x to 1.20x. PyTorch selected its memory-efficient SDPA backend in spot checks at batch 1 with a 144-slot cache and batch 8 with a 528-slot cache.
+
+After prefilling with PyTorch, capture one graph for the batch and its cache. Here `model` is `GPT2().cuda().half().eval()`, and `prompt` contains token IDs on the GPU.
+
+```python
+import torch
+
+from cuda_graph import DecodeGraph
+
+with torch.inference_mode():
+    cache = model.create_kv_cache(prompt.shape[0], max_length=prompt.shape[1] + 16)
+    logits = model(prompt, kv_cache=cache)
+    decoder = DecodeGraph(model, cache, use_triton_attention=True)
+    for _ in range(16):
+        next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
+        logits = decoder.decode(next_token)
+```
+
+Each call updates the same cache and output buffers. Clone the output if you need to keep it after the next call. Capture a new graph for a new prompt or batch.
+
+![Growing-cache decode benchmark on NVIDIA L4](assets/growing-decode-l4.jpg)
