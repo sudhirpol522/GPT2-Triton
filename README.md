@@ -89,6 +89,8 @@ For larger workloads, graphs made much less difference and sometimes ran slightl
 
 ## Run it
 
+[Open the benchmark notebook in Colab](https://colab.research.google.com/github/sudhirpol522/GPT2-Triton/blob/main/GPT2_Triton_Colab.ipynb) or [view it on GitHub](GPT2_Triton_Colab.ipynb). It includes the saved L4 results and cells for rerunning prefill and decode.
+
 On a Colab GPU runtime:
 
 ```python
