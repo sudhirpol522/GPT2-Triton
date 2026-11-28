@@ -2,8 +2,43 @@ import torch
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
+from triton.testing import do_bench
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "block_rows": block_rows,
+                "block_output_features": block_output_features,
+                "block_input_features": block_input_features,
+            },
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for block_rows, block_output_features, block_input_features, num_warps, num_stages in [
+            (16, 64, 32, 4, 2),
+            (32, 64, 32, 4, 3),
+            (32, 128, 32, 4, 3),
+            (64, 64, 32, 4, 3),
+            (64, 128, 32, 4, 4),
+            (64, 128, 64, 4, 3),
+            (64, 256, 32, 8, 3),
+            (128, 128, 32, 8, 3),
+        ]
+    ],
+    key=[
+        "num_rows",
+        "output_features",
+        "input_features",
+        "has_bias",
+        "apply_gelu",
+        "has_residual",
+    ],
+    do_bench=lambda kernel_call, quantiles: do_bench(
+        kernel_call, warmup=5, rep=20, quantiles=quantiles
+    ),
+)
 @triton.jit
 def _linear_kernel(
     input_ptr,
@@ -77,6 +112,9 @@ def _linear_kernel(
     tl.store(output_ptr + output_offsets, output_values, mask=valid_output)
 
 
+_selected_configs = {}
+
+
 def linear(inputs, weight, bias=None, gelu=False, residual=None):
     inputs = inputs.contiguous()
     input_features = inputs.shape[-1]
@@ -85,7 +123,8 @@ def linear(inputs, weight, bias=None, gelu=False, residual=None):
     output = torch.empty(
         (*inputs.shape[:-1], output_features), device=inputs.device, dtype=inputs.dtype
     )
-    _linear_kernel[(triton.cdiv(num_rows, 32), triton.cdiv(output_features, 64))](
+
+    arguments = (
         inputs,
         weight,
         bias,
@@ -97,10 +136,58 @@ def linear(inputs, weight, bias=None, gelu=False, residual=None):
         bias is not None,
         gelu,
         residual is not None,
-        32,
-        64,
-        32,
-        num_warps=4,
-        num_stages=3,
     )
+    config_key = (
+        inputs.device,
+        inputs.dtype,
+        num_rows,
+        output_features,
+        input_features,
+        bias is not None,
+        gelu,
+        residual is not None,
+    )
+    selected_config = _selected_configs.get(config_key)
+    if selected_config is None:
+
+        def grid(meta):
+            return (
+                triton.cdiv(num_rows, meta["block_rows"]),
+                triton.cdiv(output_features, meta["block_output_features"]),
+            )
+
+        _linear_kernel[grid](*arguments)
+        best_config = _linear_kernel.best_config
+        block_rows = best_config.kwargs["block_rows"]
+        block_output_features = best_config.kwargs["block_output_features"]
+        block_input_features = best_config.kwargs["block_input_features"]
+        launch_grid = (
+            triton.cdiv(num_rows, block_rows),
+            triton.cdiv(output_features, block_output_features),
+        )
+        _selected_configs[config_key] = (
+            launch_grid,
+            block_rows,
+            block_output_features,
+            block_input_features,
+            best_config.num_warps,
+            best_config.num_stages,
+        )
+    else:
+        (
+            launch_grid,
+            block_rows,
+            block_output_features,
+            block_input_features,
+            num_warps,
+            num_stages,
+        ) = selected_config
+        _linear_kernel.fn[launch_grid](
+            *arguments,
+            block_rows,
+            block_output_features,
+            block_input_features,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
     return output
