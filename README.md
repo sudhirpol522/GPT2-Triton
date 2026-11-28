@@ -2,7 +2,7 @@
 
 I started this project to learn how to write Triton kernels and use them in a GPT-2 forward pass. The model has 124,439,808 parameters. The kernels are in `kernels/`, and `model.py` has both the PyTorch and Triton paths so I can compare them with the same weights.
 
-These experiments use random weights, FP16, and inference mode. They measure the full forward pass, including logits for every input position. There is no KV cache or cached decode path yet. A sequence length of 1 here means a one-token full forward pass.
+These experiments use random weights, FP16, and inference mode. They measure the full forward pass, including logits for every input position. The benchmark does not use a KV cache. A sequence length of 1 here means a one-token full forward pass. A PyTorch cached decode path is now included, but it is not part of the timing tables below.
 
 ## First version
 
@@ -117,3 +117,69 @@ graph.replay()
 ```
 
 Keep the input and output buffers alive while using the graph. New inputs must use the captured shape, dtype, and device. `static_output` holds the latest result and is overwritten on the next replay. Use a new capture for a different shape. Warmup finishes Triton tuning before capture begins.
+
+## PyTorch decode with a KV cache
+
+I added a PyTorch decode path first so there is a reference to check a future Triton decode kernel against. `create_kv_cache` allocates keys and values once for every layer. The prompt fills the first positions, and each decode call writes one new position. Attention reads only the filled part of the cache.
+
+```python
+import torch
+from model import GPT2
+
+model = GPT2().eval()
+prompt = torch.randint(model.config.vocab_size, (1, 8))
+
+with torch.inference_mode():
+    cache = model.create_kv_cache(batch_size=1, max_length=16)
+    logits = model(prompt, kv_cache=cache)
+    for _ in range(8):
+        next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
+        logits = model.decode(next_token, cache)
+```
+
+Create the cache after moving the model to the intended device and dtype. Each batch uses equal-length prompts without padding, and decode takes one token per sequence. Create a new cache for a new batch or prompt. The prompt and decoded tokens together must fit within `max_length` and the model's context limit.
+
+This version uses a Python cache length and slices the filled prefix, so it is an eager PyTorch reference, not a CUDA graph decode implementation. The model still uses random weights. Run `python -m unittest test_decode.py` to check cached logits, greedy token choices, unchanged cache storage, and input validation against the full forward path.
+
+I ran the cached decode path on the Colab NVIDIA L4 in FP16 with PyTorch `2.14.1+cu130`. Both paths project only the last token to logits. The uncached path reruns the transformer on the growing prefix. The table reports milliseconds per decode step, using the median of three 16-step runs after warmup. Prefill, cache allocation, and sampling are outside the measurement.
+
+| Batch | Prompt tokens | Uncached | Cached | Uncached / cached |
+| --- | --- | --- | --- | --- |
+| 1 | 32 | 5.532 | 6.177 | 0.90x |
+| 1 | 128 | 5.371 | 6.192 | 0.87x |
+| 1 | 512 | 5.319 | 6.300 | 0.84x |
+| 1 | 1008 | 5.490 | 6.411 | 0.86x |
+| 4 | 128 | 5.498 | 6.469 | 0.85x |
+| 4 | 512 | 10.933 | 6.732 | 1.62x |
+| 8 | 128 | 5.478 | 6.486 | 0.84x |
+| 8 | 512 | 24.604 | 6.509 | 3.78x |
+
+All 128 decode steps passed the FP16 logit check (`atol=1e-2`, `rtol=1e-2`). The largest absolute difference was 0.004883. The key and value buffers kept the same addresses throughout decoding. A separate batch of two sequences produced the same greedy token choices for eight steps.
+
+### Profiling decode on the L4
+
+I profiled eight consecutive steps per workload with the [PyTorch profiler](https://docs.pytorch.org/docs/stable/profiler.html) on the same GPU and dtype. I collected a trace for each cached and uncached workload. I timed eager decode separately because profiling adds CPU overhead. The table shows GPU activity per cached step, in milliseconds.
+
+| Batch | Prompt tokens | All GPU work | Linear layers | Attention | KV writes |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 128 | 1.455 | 1.136 | 0.126 | 0.052 |
+| 1 | 512 | 1.508 | 1.144 | 0.170 | 0.052 |
+| 1 | 1008 | 1.580 | 1.148 | 0.239 | 0.052 |
+| 8 | 512 | 2.047 | 1.144 | 0.708 | 0.052 |
+
+At batch 1 and 128 prompt tokens, caching reduced active GPU work from 1.591 ms to 1.455 ms, while eager latency rose from 5.358 ms to 6.237 ms in this rerun. The cached step issued 150 GPU operations versus 138 uncached. The 24 KV copies together took about 0.052 ms on the GPU and 0.490 ms in their CPU profiler events. The CPU copy number includes profiler overhead. PyTorch picked FlashAttention in all eight traces.
+
+I then captured a single cached decode step using a fixed position. Each replay changes the token and overwrites the same KV slot. The times below are the median of three runs of 20 steps after warmup. Replay includes the input copy. Two changed-input checks per shape passed against eager decode (`atol=1e-3`, `rtol=1e-3`).
+
+| Batch | Cached prefix tokens | Eager (ms) | Graph replay (ms) | Speedup |
+| --- | --- | --- | --- | --- |
+| 1 | 128 | 6.365 | 1.435 | 4.44x |
+| 1 | 512 | 6.566 | 1.487 | 4.41x |
+| 1 | 1008 | 6.486 | 1.559 | 4.16x |
+| 8 | 512 | 6.403 | 2.112 | 3.03x |
+
+This suggests trying graph replay with a growing cache position first for small batches. Linear layers accounted for about 78% of GPU work at batch 1 and 128 tokens. Attention took a bigger share at batch 8 and 512 tokens, reaching about 35% of active GPU time. I would use that larger shape to check whether a custom attention kernel helps after measuring growing-context graph decode.
+
+![Decode profile and fixed-position graph probe on NVIDIA L4](assets/decode-profile-l4.jpg)
+
+[Download the L4 trace archive](assets/decode-profile-l4.zip) for the eight profiler traces and both sets of summary numbers. The public copy omits the Colab runtime hostname.
